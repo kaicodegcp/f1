@@ -1,0 +1,17 @@
+# 0) Verify the exact branch name on the remote
+git ls-remote --heads https://bitbucket.com/scm/gvu/gvu-profile.git | grep -i FNCOFFFT-32233
+
+# If you see a line ending with refs/heads/FNCOFFFT-32233, proceed:
+
+# 1) Clone the repo (default branch)
+git clone https://bitbucket.fanniemae.com/scm/gvu/gvu-profile.git
+cd gvu-profile
+
+# 2) Fetch all branches explicitly (belt-and-suspenders)
+git fetch --all --prune
+
+# 3) Check the branch exists locally as a remote-tracking branch
+git branch -r | grep FNCOFFFT-32233
+
+# 4) Check out that branch
+git checkout -b FNCOFFFT-32233 --track origin/FNCOFFFT-32233

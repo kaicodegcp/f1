@@ -4,7 +4,7 @@ git ls-remote --heads https://bitbucket.com/scm/gvu/gvu-profile.git | grep -i FN
 # If you see a line ending with refs/heads/FNCOFFFT-32233, proceed:
 
 # 1) Clone the repo (default branch)
-git clone https://bitbucket.fanniemae.com/scm/gvu/gvu-profile.git
+git clone https://bitbucket.com/scm/gvu/gvu-profile.git
 cd gvu-profile
 
 # 2) Fetch all branches explicitly (belt-and-suspenders)

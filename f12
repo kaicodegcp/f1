@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Ozone/Cloudera manual cleanup helper
+#
+# Safely unmount, remove fstab entries, and (optionally) wipe disks.
+# Designed for base/OM/SCM/RECON layouts from your EAP Ozone project.
+#
+# USAGE:
+#   sudo ./ozone_cleanup.sh --dry-run
+#   sudo ./ozone_cleanup.sh --tag "ansible:ozone-managed" --really-wipe
+#   sudo ./ozone_cleanup.sh --patterns --really-wipe
+#   sudo ./ozone_cleanup.sh --extra-devices "/dev/sdb,/dev/sdc" --really-wipe
+#
+# Key options:
+#   --dry-run           : Show what would be done (default: off)
+#   --tag <string>      : Only handle fstab lines containing this tag/comment
+#                         (e.g., "ansible:ozone-managed")
+#   --patterns          : Also include known Ozone/Cloudera paths by glob patterns
+#   --extra-devices csv : Optional extra block devices to wipe (CSV: /dev/sdb,/dev/sdc)
+#   --keep-fstab        : Do NOT edit /etc/fstab (default: edit)
+#   --really-wipe       : Actually wipefs/sgdisk the devices (DANGEROUS)
+#   --yes-i-am-sure     : Skip interactive confirmation if --really-wipe is used
+#
+# What we consider "safe system mounts" to never touch:
+#   / /boot /boot/efi /usr /var /opt (only /opt/cloudera* by patterns) /home /tmp /run /dev /sys /proc
+#
+# REQUIREMENTS: bash, awk, sed, grep, lsblk, umount, wipefs, sgdisk, partprobe
+# ============================================================
+
+DRY_RUN=0
+TAG=""
+PATTERNS=0
+EXTRA_DEVICES=""
+KEEP_FSTAB=0
+REALLY_WIPE=0
+AUTO_CONFIRM=0
+
+log()  { printf "[%s] %s\n" "$(date +'%F %T')" "$*" >&2; }
+die()  { log "ERROR: $*"; exit 1; }
+run()  { if [[ $DRY_RUN -eq 1 ]]; then echo "DRY-RUN: $*"; else eval "$@"; fi; }
+
+usage() {
+  sed -n '1,120p' "$0" | sed -n '1,85p'
+}
+
+# ---------- Parse args ----------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --tag) shift; TAG="${1:-}"; [[ -z "$TAG" ]] && die "--tag requires a string";;
+    --patterns) PATTERNS=1 ;;
+    --extra-devices) shift; EXTRA_DEVICES="${1:-}";;
+    --keep-fstab) KEEP_FSTAB=1 ;;
+    --really-wipe) REALLY_WIPE=1 ;;
+    --yes-i-am-sure) AUTO_CONFIRM=1 ;;
+    -h|--help) usage; exit 0;;
+    *) die "Unknown option: $1 (use -h for help)";;
+  esac
+  shift
+done
+
+# ---------- Safety checks ----------
+[[ $EUID -ne 0 ]] && die "Please run as root."
+command -v lsblk >/dev/null || die "lsblk not found"
+command -v wipefs >/dev/null || die "wipefs not found (yum install util-linux)"
+command -v sgdisk >/dev/null || die "sgdisk not found (yum install gdisk)"
+
+SAFE_MOUNTS_REGEX='^(/|/boot|/boot/efi|/usr|/var$|/home|/tmp|/run|/dev|/sys|/proc)(/|$)'
+OZONE_PATHS_REGEX='^(/var/app/lib/hadoop-ozone|/var/app/lib/hadoop-ozone/(om|scm|recon)|/var/app/log|/var/app/lib|/opt/cloudera)'
+
+# ---------- Gather candidates from fstab ----------
+mapfile -t FSTAB_LINES < <(grep -vE '^\s*#' /etc/fstab | awk 'NF>=2{print $0}')
+CANDIDATE_MOUNTS=()
+CANDIDATE_DEVICES=()
+
+if [[ -n "$TAG" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" == *"$TAG"* ]] || continue
+    dev=$(awk '{print $1}' <<< "$line")
+    mnt=$(awk '{print $2}' <<< "$line")
+    [[ "$mnt" =~ $SAFE_MOUNTS_REGEX ]] && continue
+    CANDIDATE_MOUNTS+=("$mnt")
+    CANDIDATE_DEVICES+=("$dev")
+  done < <(printf "%s\n" "${FSTAB_LINES[@]}")
+  log "Collected $((${#CANDIDATE_MOUNTS[@]})) mounts from fstab tag '$TAG'."
+fi
+
+# ---------- Gather pattern-based candidates (optional) ----------
+if [[ $PATTERNS -eq 1 ]]; then
+  # Find currently mounted paths matching Ozone/Cloudera layout
+  mapfile -t MOUNTED < <(mount | awk '{print $3}')
+  for m in "${MOUNTED[@]}"; do
+    [[ "$m" =~ $SAFE_MOUNTS_REGEX ]] && continue
+    [[ "$m" =~ $OZONE_PATHS_REGEX ]] || continue
+    CANDIDATE_MOUNTS+=("$m")
+    # Find backing device from mount output
+    dev=$(mount | grep -E " on ${m//\//\\/} " | awk '{print $1}' | head -1)
+    [[ -n "$dev" ]] && CANDIDATE_DEVICES+=("$dev")
+  done
+  log "Collected pattern-matched mounts as candidates."
+fi
+
+# ---------- Include extra devices if provided ----------
+if [[ -n "$EXTRA_DEVICES" ]]; then
+  IFS=',' read -r -a EXTRA_ARR <<< "$EXTRA_DEVICES"
+  for d in "${EXTRA_ARR[@]}"; do
+    CANDIDATE_DEVICES+=("$d")
+  done
+  log "Added extra devices: $EXTRA_DEVICES"
+fi
+
+# ---------- De-duplicate ----------
+dedup() {
+  awk '!seen[$0]++'
+}
+CANDIDATE_MOUNTS=($(printf "%s\n" "${CANDIDATE_MOUNTS[@]}" | dedup))
+CANDIDATE_DEVICES=($(printf "%s\n" "${CANDIDATE_DEVICES[@]}" | dedup))
+
+log "Final candidates: ${#CANDIDATE_MOUNTS[@]} mounts, ${#CANDIDATE_DEVICES[@]} devices."
+
+# ---------- Unmount phase ----------
+if ((${#CANDIDATE_MOUNTS[@]})); then
+  log "Unmounting candidate mount points..."
+  # Unmount children first (reverse-sort by path length)
+  for m in $(printf "%s\n" "${CANDIDATE_MOUNTS[@]}" | awk '{print length, $0}' | sort -nr | cut -d' ' -f2-); do
+    if mountpoint -q -- "$m"; then
+      run "umount -fl -- '$m'" || true
+    fi
+  done
+fi
+
+# ---------- /etc/fstab cleanup ----------
+if [[ $KEEP_FSTAB -eq 0 ]]; then
+  if [[ -n "$TAG" ]]; then
+    log "Removing /etc/fstab lines containing tag: $TAG"
+    run "sed -i.bak -e '/$TAG/d' /etc/fstab"
+  elif [[ $PATTERNS -eq 1 ]]; then
+    log "Removing /etc/fstab lines with Ozone/Cloudera paths"
+    run "sed -i.bak -E '/\\s\\/var\\/app\\/lib\\/hadoop-ozone|\\s\\/var\\/app\\/log|\\s\\/opt\\/cloudera/d' /etc/fstab"
+  else
+    log "KEEPING /etc/fstab (no tag/patterns specified). Use --tag or --patterns to edit."
+  fi
+fi
+
+# ---------- Device sanity filter (never touch system/root devices) ----------
+is_system_device() {
+  local d="$1"
+  # Identify the root device by checking mountpoint "/"
+  local rootdev
+  rootdev=$(findmnt -n -o SOURCE / || true)
+  [[ -n "$rootdev" && "$d" == "$rootdev"* ]] && return 0
+  # Exclude loop, dm-crypt/LVM logicals (they might be safe, but we avoid by default)
+  [[ "$d" =~ ^/dev/loop ]] && return 0
+  [[ "$d" =~ ^/dev/dm- ]] && return 0
+  [[ "$d" =~ ^/dev/mapper/ ]] && return 0
+  return 1
+}
+
+FILTERED_DEVICES=()
+for d in "${CANDIDATE_DEVICES[@]}"; do
+  if is_system_device "$d"; then
+    log "Skipping system/unknown device: $d"
+  else
+    FILTERED_DEVICES+=("$d")
+  fi
+done
+
+# ---------- Wipe phase ----------
+if ((${#FILTERED_DEVICES[@]})); then
+  if [[ $REALLY_WIPE -eq 1 ]]; then
+    if [[ $AUTO_CONFIRM -ne 1 ]]; then
+      echo
+      echo "!!! DANGEROUS OPERATION !!!"
+      echo "About to WIPE devices:"
+      printf "  %s\n" "${FILTERED_DEVICES[@]}"
+      read -r -p "Type 'WIPE' to continue: " ans
+      [[ "$ans" == "WIPE" ]] || die "Aborted by user."
+    fi
+    log "Wiping devices with wipefs + sgdisk..."
+    for d in "${FILTERED_DEVICES[@]}"; do
+      run "wipefs -fa '$d' || true"
+      run "sgdisk --zap-all '$d' || true"
+      run "partprobe '$d' || true"
+    done
+  else
+    log "Skipping device wipe (no --really-wipe). Devices that WOULD be wiped:"
+    printf "  %s\n" "${FILTERED_DEVICES[@]}"
+  fi
+fi
+
+# ---------- Remove empty directories ----------
+if ((${#CANDIDATE_MOUNTS[@]})); then
+  log "Removing empty mount directories (best-effort)..."
+  for m in "${CANDIDATE_MOUNTS[@]}"; do
+    if [[ -d "$m" ]]; then
+      # Only remove if empty
+      if [[ -z "$(ls -A "$m" 2>/dev/null || true)" ]]; then
+        run "rmdir '$m' || true"
+      else
+        log "Directory not empty, left in place: $m"
+      fi
+    fi
+  done
+fi
+
+log "Cleanup complete."

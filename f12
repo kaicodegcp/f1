@@ -203,6 +203,62 @@ if ((${#CANDIDATE_MOUNTS[@]})); then
       fi
     fi
   done
+
+
+
+
+Thought for 1m 40s
+
+Short answer: the run finished, but it didn’t actually clean anything.
+
+Why: the script reported Final candidates: 0 mounts, 0 devices. Your /data/1..12 mounts are still present in df -h. That’s expected because the default pattern set only targets Ozone/Cloudera paths (e.g., /var/app/lib/hadoop-ozone/*, /var/app/log, /opt/cloudera) — not /data/*.
+
+Do you want /data/* cleaned too?
+
+Two quick ways:
+
+A) Small patch + rerun (easiest)
+
+Edit two lines in cleanup.sh to include /data:
+
+Add /data to the regex:
+
+OZONE_PATHS_REGEX='^(/var/app/lib/hadoop-ozone|/var/app/log|/var/app/lib|/opt/cloudera|/data)'
+
+
+Add /data to the fstab removal:
+
+sed -i.bak -E '/\s\/var\/app\/lib\/hadoop-ozone|\s\/var\/app\/log|\s\/var\/app\/lib|\s\/opt\/cloudera|\s\/data\//d' /etc/fstab
+
+
+Then run:
+
+sudo ./cleanup.sh --patterns --really-wipe --yes-i-am-sure
+
+B) No script change: one-off cleanup for /data/*
+# 1) Capture the backing devices for /data/* BEFORE unmounting
+DEVLIST=$(findmnt -rn -o SOURCE,TARGET | awk '$2 ~ "^/data/" {print $1}' | sort -u | paste -sd, -)
+
+# 2) Unmount deepest paths first
+for m in $(findmnt -rn -o TARGET | grep '^/data/' | awk '{print length, $0}' | sort -nr | cut -d" " -f2-); do
+  umount -fl "$m" || true
+done
+
+# 3) Remove /data/* lines from fstab
+sed -i.bak -E '/\s\/data\//d' /etc/fstab
+
+# 4) Wipe those devices
+sudo ./cleanup.sh --extra-devices "$DEVLIST" --really-wipe --yes-i-am-sure --keep-fstab
+
+Verify
+mount | grep '^/data/'            # no output
+grep -E '\s/data/' /etc/fstab     # no output
+lsblk -f | grep -E '^sd[b-z]'     # wiped devices should have no FS
+
+
+Want me to bake /data/* into the script by default and re-post the full file?
+
+ChatGPT can make mistakes. Check important info.
 fi
 
 log "Cleanup complete."

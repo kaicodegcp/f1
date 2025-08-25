@@ -1,2 +1,49 @@
-# 0) Verify the exact branch name on the remote
-git ls-remote --heads https://bitbucket.com/scm
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+
+file_path = "your_file.parquet"
+
+# --- Get schema as an Arrow Schema (works across versions) ---
+# Primary: read_schema; Fallback: ParquetFile.schema_arrow
+try:
+    arrow_schema: pa.Schema = pq.read_schema(file_path)
+except Exception:
+    pf = pq.ParquetFile(file_path)
+    # Some older versions use .schema_arrow; keep a final fallback to .schema.to_arrow_schema()
+    arrow_schema = getattr(pf, "schema_arrow", None) or pf.schema.to_arrow_schema()
+
+# Build a DataFrame of column name, data type, and nullability
+rows = []
+for f in arrow_schema:  # f is pa.Field
+    rows.append({
+        "Column Name": f.name,
+        "Data Type": str(f.type),
+        "Nullable": f.nullable,
+    })
+df_schema = pd.DataFrame(rows, columns=["Column Name", "Data Type", "Nullable"])
+
+# Pretty print all columns
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", None)
+print("\n=== Column Names, Data Types, Nullable ===")
+print(df_schema.to_string(index=False))
+
+# --- Read just a single row efficiently ---
+dataset = ds.dataset(file_path, format="parquet")
+first_row_tbl = dataset.head(1)           # very small read
+first_row_df = first_row_tbl.to_pandas()
+
+print("\n=== First Row (all columns) ===")
+print(first_row_df.to_string(index=False))
+
+# OPTIONAL: add a sample value column aligned to schema for quick glance
+if not first_row_df.empty:
+    sample = first_row_df.iloc[0].apply(lambda v: repr(v))
+    df_schema_with_sample = df_schema.copy()
+    df_schema_with_sample["Sample Value (row 1)"] = [
+        sample.get(col, None) for col in df_schema_with_sample["Column Name"]
+    ]
+    print("\n=== Column Names, Types, Nullable, Sample Value ===")
+    print(df_schema_with_sample.to_string(index=False))
